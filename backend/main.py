@@ -1,19 +1,15 @@
-import asyncio
-import requests
-import ollama
-
-from fastapi import FastAPI, HTTPException
+import os
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+import ollama
+from tavily import TavilyClient
+from youtubesearchpython import VideosSearch
+from dotenv import load_dotenv
 
-from qdrant_client import QdrantClient
+load_dotenv()
 
-app = FastAPI(title="Generative Search Engine API")
-
-
-# CORS
-
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,243 +19,94 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# QDRANT CONNECTION
-
-qdrant_client = QdrantClient(
-    host="localhost",
-    port=6333
-)
-
-
-# REQUEST MODEL
-
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 
 class SearchRequest(BaseModel):
     query: str
 
+def determine_intent(query: str) -> str:
+    q = query.lower().strip()
+    research_triggers = [
+        "explain", "what is", "how to", "why does", "calculus", 
+        "tutorial", "derive", "theory", "difference between", 
+        "teach me", "guide", "concept"
+    ]
+    if any(trigger in q for trigger in research_triggers):
+        return "ai"
+    return "web"
 
-# INTENT CLASSIFIER
-
-
-def classify_intent(query: str) -> str:
-
-    research_keywords = [
-        "give me",
-        "explain",
-        "why",
-        "how",
-        "compare",
-        "write",
-        "summarize"
-        "what is",
-        "where is",
-        "when does",
-        "tutoriol",
-        "guide",
-        "tips",
-        "ideas",
-        "example",
-        "history",
-        "meaning",
-        "case study",
-        "documentation"
+def get_youtube_results(query: str):
+    try:
+        videos = VideosSearch(query, limit=4).result()["result"]
+        if videos:
+            return [{"title": v["title"], "url": v["link"]} for v in videos]
+    except Exception as e:
+        print("YouTube Search Error:", e)
+    
+    # FALLBACK: If YouTube library fails or blocks, generate reliable direct educational links
+    return [
+        {"title": f"Introduction to {query} on YouTube", "url": f"https://www.youtube.com/results?search_query={query}"},
+        {"title": f"{query} Crash Course Tutorial", "url": f"https://www.youtube.com/results?search_query={query}+tutorial"}
     ]
 
-    query_lower = query.lower()
-     
-    if query_lower.startswitch("research"):
-       return "Research"
- 
-
-
-    if any(keyword in query_lower for keyword in research_keywords):
-        return "Research"
-    
-    return "Search"
-
-
-
-# EMBEDDING FUNCTION
-
-
-def get_embedding(text):
-
-    response = requests.post(
-        "http://localhost:11434/api/embeddings",
-        json={
-            "model": "nomic-embed-text",
-            "prompt": text
-        }
-    )
-
-    return response.json()["embedding"]
-
-
-# QDRANT SEARCH
-
-
-def search_documents(query):
-
-    query_embedding = get_embedding(query)
-
-    results = qdrant_client.query_points(
-        collection_name="documents",
-        query=query_embedding,
-        limit=3
-    )
-
-    documents = []
-
-    for point in results.points:
-        documents.append(
-            point.payload["text"]
-        )
-
-    return documents
-
-
-
-# STREAMING GENERATOR
-
-async def llama_stream_generator(prompt_text):
-
-    try:
-
-        response_stream = ollama.chat(
-            model="llama3",
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt_text
-                }
-            ],
-            stream=True
-        )
-
-        for chunk in response_stream:
-
-            content = chunk["message"]["content"]
-
-            if content:
-                yield content
-                await asyncio.sleep(0.01)
-
-    except Exception as e:
-
-        yield f"\nError: {str(e)}"
-
-
-# MAIN ENDPOINT
-
-
 @app.post("/api/generative-search")
-async def generative_search(request: SearchRequest):
-
-    if not request.query.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Query cannot be empty"
-        )
-
-    intent = classify_intent(request.query)
-
+async def search(req: SearchRequest):
+    query = req.query
+    intent = determine_intent(query)
     
-    # SEARCH MODE
-    
+    web_results = []
+    image_results = []
+    context_text = ""
 
-    if intent == "Search":
+    # Fetch live text AND images via Tavily Search API
+    try:
+        tavily_response = tavily_client.search(query=query, max_results=5, include_images=True)
+        
+        # 1. Parse Web Results
+        for result in tavily_response.get("results", []):
+            web_results.append({
+                "title": result.get("title", "No Title Specified"),
+                "url": result.get("url", "https://google.com"),
+                "snippet": result.get("content", "")
+            })
+        context_text = " ".join([r["title"] + " " + r["snippet"] for r in web_results])
+        
+        # 2. Parse Live Real Images from Tavily!
+        raw_images = tavily_response.get("images", [])
+        if raw_images:
+            for img in raw_images[:4]:
+                # Handle dictionary or raw string formats seamlessly
+                img_url = img.get("url") if isinstance(img, dict) else img
+                if img_url:
+                    image_results.append({"url": img_url})
+                    
+    except Exception as e:
+        print("Tavily Error Extraction Exception:", e)
 
-        documents = search_documents(
-            request.query
-        )
-
-        results = []
-
-        for doc in documents:
-
-            results.append(
-                {
-                    "title": doc,
-                    "snippet": doc,
-                    "url": "#"
-                }
+  
+  
+    answer = ""
+    if intent == "ai":
+        try:
+            ai_res = ollama.chat(
+                model="llama3",
+                messages=[{
+                    "role": "user",
+                    "content": f"You are Gemini. Explain this topic elegantly with crisp layouts, paragraphs, and lists:\nQuery: {query}\nContext: {context_text}"
+                }]
             )
-
-        return {
-            "intent": "Search",
-            "results": results
-        }
-
-    
-    # RESEARCH MODE (RAG)
-
-
-    documents = search_documents(
-        request.query
-    )
-
-    context = "\n".join(documents)
-    prompt = f"""
-     You are an expert research assistant.
-
-     Use the provided context to answer the user's question.
-
-     Context:
-     {context}
-
-     Question:
-    {request.query}
-
-     Generate a detailed research report using EXACTLY this format:
-
-     # Overview
-     Provide a short introduction.
-
-     # Key Concepts
-     Explain the main concepts.
-
-     # Advantages
-     List important advantages.
-
-     # Disadvantages
-     List limitations or drawbacks.
-
-     # Applications
-     Explain real-world use cases.
-
-     # Conclusion
-     Provide a concise conclusion.
-
-     Keep the answer professional and well-structured.
-     """
-    return StreamingResponse(
-        llama_stream_generator(prompt),
-        media_type="text/plain"
-    )
-
-
-# ROOT
-
-
-@app.get("/")
-def root():
+            answer = ai_res["message"]["content"]
+        except:
+            answer = "AI generation node failed to synthesize payload."
 
     return {
-        "status": "running",
-        "project": "Generative Search Engine"
+        "intent": intent, 
+        "answer": answer,
+        "web_results": web_results,
+  
+        "followups": [
+            f"Core foundational frameworks of {query}",
+            f"Practical implementations of {query}"
+        ]
     }
-
-
-# RUN
-
-if __name__ == "__main__":
-
-    import uvicorn
-
-    uvicorn.run(
-        "main:app",
-        host="127.0.0.1",
-        port=8000,
-        reload=True
-    )
